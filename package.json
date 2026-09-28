@@ -6,7 +6,8 @@
   "scripts": {
     "agent": "tsx src/index.ts",
     "web": "tsx src/server.ts",
-    "eval": "tsx src/eval.ts"
+    "eval": "tsx src/eval.ts",
+    "test": "tsx --test tests/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

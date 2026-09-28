@@ -37,6 +37,11 @@ const HARD_BLOCK: { pattern: RegExp; why: string }[] = [
   { pattern: /(^|[^\w])rm\s+\/\s*$/i, why: "rm 根目录" },
 ];
 
+// 第 1 层判断(纯函数,方便单测):命令是否命中硬规则黑名单。命中返回规则,否则 null。
+export function checkHardBlock(command: string): { pattern: RegExp; why: string } | null {
+  return HARD_BLOCK.find((r) => r.pattern.test(command)) ?? null;
+}
+
 export interface GuardResult {
   tool: string;
   guarded: boolean; // 是否真的过了安全门(普通工具 = false,直接放行)
@@ -94,7 +99,7 @@ export async function guardToolCall(name: string, args: string): Promise<GuardRe
   const command = extractState(args);
 
   // 第 1 层:硬规则黑名单(不赌模型)
-  const hit = HARD_BLOCK.find((r) => r.pattern.test(command));
+  const hit = checkHardBlock(command);
   if (hit) {
     return {
       tool: name,

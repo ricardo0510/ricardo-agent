@@ -8,7 +8,7 @@
 // 配套引入上下文窗口管理:历史无限累积会撑爆模型的 token 限制,
 // 所以每轮结束后按「轮次」裁剪,保留 system + 最近 N 轮。
 
-import { chatStream, type Message } from "./llm.js";
+import { chatStream, type Message, type Usage } from "./llm.js";
 import { TOOLS, runTool } from "./tools.js";
 import { guardToolCall, type GuardResult } from "./guard.js";
 
@@ -38,20 +38,39 @@ function trimConversation(conv: Conversation, maxRounds = MAX_ROUNDS): void {
   conv.messages = [msgs[0], ...msgs.slice(keepFrom)]; // system + 最近 N 轮
 }
 
+// 一次 agent 运行的统计:调了哪些工具 + 累计 token 用量(给后台可观测性用)
+export interface RunStats {
+  toolsCalled: string[];
+  usage?: Usage;
+}
+
 export interface AgentEvents {
   onToken: (chunk: string) => void;
   onToolCall: (name: string, args: string) => void;
   onToolResult: (result: string) => void;
   onGuard?: (guard: GuardResult) => void; // 安全门决策回调(可选)
-  onDone: () => void;
+  onDone: (stats: RunStats) => void;
 }
 
 export async function runAgent(conv: Conversation, userInput: string, events: AgentEvents): Promise<void> {
   const messages = conv.messages;
   messages.push({ role: "user", content: userInput }); // 追加,不清空 = 记住历史
 
+  const toolsCalled: string[] = [];
+  let usage: Usage | undefined;
+
   for (let step = 0; step < MAX_STEPS; step++) {
-    const { content, toolCalls } = await chatStream(messages, TOOLS, events.onToken);
+    const { content, toolCalls, usage: stepUsage } = await chatStream(messages, TOOLS, events.onToken);
+    // 累计 token(多轮 ReAct 循环里每一轮都消耗)
+    if (stepUsage) {
+      usage = usage
+        ? {
+            prompt_tokens: usage.prompt_tokens + stepUsage.prompt_tokens,
+            completion_tokens: usage.completion_tokens + stepUsage.completion_tokens,
+            total_tokens: usage.total_tokens + stepUsage.total_tokens,
+          }
+        : { ...stepUsage };
+    }
 
     messages.push({
       role: "assistant",
@@ -61,11 +80,12 @@ export async function runAgent(conv: Conversation, userInput: string, events: Ag
 
     if (toolCalls.length === 0) {
       trimConversation(conv);
-      events.onDone();
+      events.onDone({ toolsCalled, usage });
       return;
     }
 
     for (const call of toolCalls) {
+      toolsCalled.push(call.function.name);
       events.onToolCall(call.function.name, call.function.arguments);
       // 安全门:有副作用的工具(如 run_shell)在执行前先过 Kev 判断。
       // 普通工具 guardToolCall 直接放行,零开销。
@@ -83,5 +103,5 @@ export async function runAgent(conv: Conversation, userInput: string, events: Ag
   }
 
   trimConversation(conv);
-  events.onDone();
+  events.onDone({ toolsCalled, usage });
 }

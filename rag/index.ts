@@ -33,8 +33,9 @@ export interface RagIndex {
 export async function buildIndex(): Promise<RagIndex> {
   const files = (await readdir(DOCS_DIR)).filter((f) => /\.(md|txt)$/.test(f));
   if (files.length === 0) {
-    console.error("❌ rag/docs/ 下没有文档,放几个 .md 文件进去。");
-    process.exit(1);
+    // 抛错而不是 process.exit:库函数不该自己决定进程生死,
+    // 让调用方(CLI / admin 后台)决定怎么处理「没文档」的情况。
+    throw new Error("rag/docs/ 下没有文档,请先上传文档。");
   }
 
   const chunks: Chunk[] = [];
@@ -75,7 +76,7 @@ export interface Answer {
 
 export async function answer(rag: RagIndex, question: string): Promise<Answer> {
   const out = await rag.extractor(question, { pooling: "mean", normalize: true });
-  const qvec = Array.from(out.data);
+  const qvec = Array.from(out.data as number[]);
 
   const top = rag.chunks
     .map((c) => ({ ...c, score: cosine(qvec, c.vec!) }))

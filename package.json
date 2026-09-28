@@ -7,6 +7,7 @@
     "agent": "tsx src/index.ts",
     "web": "tsx src/server.ts",
     "eval": "tsx src/eval.ts",
+    "admin": "tsx admin/server.ts",
     "test": "tsx --test tests/*.test.ts"
   },
   "devDependencies": {

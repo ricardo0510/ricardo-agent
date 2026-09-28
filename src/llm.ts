@@ -21,6 +21,14 @@ export interface Message {
   content?: string | null;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
+  usage?: Usage; // 非流式 chat 附加的 token 用量(可观测性统计用)
+}
+
+// OpenAI 兼容接口返回的 token 用量
+export interface Usage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
 }
 
 // 每次调用时读 env(而不是模块加载时):因为调用方可能先 chdir + loadEnv,
@@ -88,8 +96,10 @@ export async function chat(messages: Message[], tools?: ToolDef[]): Promise<Mess
     throw new Error(`API 错误 ${res.status}: ${text.slice(0, 500)}`);
   }
 
-  const data = (await res.json()) as { choices: { message: Message }[] };
-  return data.choices[0].message;
+  const data = (await res.json()) as { choices: { message: Message }[]; usage?: Usage };
+  const message = data.choices[0].message;
+  if (data.usage) message.usage = data.usage;
+  return message;
 }
 
 // ---------- 流式:内容逐字吐,工具调用分片拼接 ----------
@@ -97,6 +107,7 @@ export async function chat(messages: Message[], tools?: ToolDef[]): Promise<Mess
 export interface StreamResult {
   content: string;
   toolCalls: ToolCall[];
+  usage?: Usage; // 流式最后一块带 usage(需 stream_options.include_usage)
 }
 
 export async function chatStream(
@@ -117,6 +128,7 @@ export async function chatStream(
       tools: tools && tools.length > 0 ? tools : undefined,
       temperature: 0.2,
       stream: true, // 关键:开流式
+      stream_options: { include_usage: true }, // 让最后一块带上 token 用量
     }),
   });
 
@@ -130,6 +142,7 @@ export async function chatStream(
   const decoder = new TextDecoder();
   let buffer = "";
   let content = "";
+  let usage: Usage | undefined;
   const toolCalls: ToolCall[] = []; // 按 index 累积(模型可能同时调多个工具)
 
   while (true) {
@@ -149,6 +162,11 @@ export async function chatStream(
       try {
         json = JSON.parse(payload);
       } catch {
+        continue;
+      }
+      // 最后一个 chunk:choices 为空,只带 usage(因为开了 include_usage)
+      if (json.usage) {
+        usage = json.usage;
         continue;
       }
       const delta = json.choices?.[0]?.delta;
@@ -175,5 +193,5 @@ export async function chatStream(
     }
   }
 
-  return { content, toolCalls: toolCalls.filter(Boolean) };
+  return { content, toolCalls: toolCalls.filter(Boolean), usage };
 }

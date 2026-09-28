@@ -1,0 +1,20 @@
+{
+  "name": "agent-cli-framework",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "AI SDK 7 版:用框架重写 src/ 里的手写 agent,做对比",
+  "scripts": {
+    "agent": "tsx main.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/deepseek": "^3.0.40",
+    "ai": "^7.0.94",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

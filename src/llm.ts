@@ -32,11 +32,44 @@ function apiConfig() {
   };
 }
 
+// ---------- 带超时 + 重试的 fetch(生产级必做)----------
+// 两个坑,裸 fetch 都不管:
+//   1. 请求挂死 —— 用 AbortController 加超时,到点主动中断
+//   2. 瞬时故障 —— 网络抖动 / 429 限流 / 5xx 服务错误,指数退避重试;
+//      4xx 客户端错误(参数错、鉴权错)不重试,因为重试也不会变对
+const FETCH_TIMEOUT_MS = 60_000;
+const MAX_RETRIES = 2; // 共 3 次尝试
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+      const retryable = res.status === 429 || res.status >= 500;
+      if (!retryable || attempt === MAX_RETRIES) return res;
+      lastError = new Error(`HTTP ${res.status}(可重试)`);
+    } catch (e) {
+      lastError = e;
+      if (attempt === MAX_RETRIES) throw e;
+    } finally {
+      clearTimeout(timer);
+    }
+    await sleep(500 * 2 ** attempt); // 指数退避:500ms → 1s
+  }
+  throw lastError;
+}
+
 // ---------- 非流式:一次拿到完整回复 ----------
 
 export async function chat(messages: Message[], tools?: ToolDef[]): Promise<Message> {
   const { baseUrl, model } = apiConfig();
-  const res = await fetch(`${baseUrl}/chat/completions`, {
+  const res = await fetchWithRetry(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -72,7 +105,7 @@ export async function chatStream(
   onContent: (chunk: string) => void
 ): Promise<StreamResult> {
   const { baseUrl, model } = apiConfig();
-  const res = await fetch(`${baseUrl}/chat/completions`, {
+  const res = await fetchWithRetry(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

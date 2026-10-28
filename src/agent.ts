@@ -42,6 +42,7 @@ function trimConversation(conv: Conversation, maxRounds = MAX_ROUNDS): void {
 export interface RunStats {
   toolsCalled: string[];
   usage?: Usage;
+  maxStepsReached?: boolean;
 }
 
 export interface AgentEvents {
@@ -53,55 +54,67 @@ export interface AgentEvents {
 }
 
 export async function runAgent(conv: Conversation, userInput: string, events: AgentEvents): Promise<void> {
-  const messages = conv.messages;
+  // 在副本上执行：中途失败时不把半截 user/assistant/tool 消息写回会话。
+  const messages = [...conv.messages];
   messages.push({ role: "user", content: userInput }); // 追加,不清空 = 记住历史
 
   const toolsCalled: string[] = [];
   let usage: Usage | undefined;
+  let completed = false;
 
-  for (let step = 0; step < MAX_STEPS; step++) {
-    const { content, toolCalls, usage: stepUsage } = await chatStream(messages, TOOLS, events.onToken);
-    // 累计 token(多轮 ReAct 循环里每一轮都消耗)
-    if (stepUsage) {
-      usage = usage
-        ? {
-            prompt_tokens: usage.prompt_tokens + stepUsage.prompt_tokens,
-            completion_tokens: usage.completion_tokens + stepUsage.completion_tokens,
-            total_tokens: usage.total_tokens + stepUsage.total_tokens,
-          }
-        : { ...stepUsage };
-    }
-
-    messages.push({
-      role: "assistant",
-      content: content || null,
-      tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
-    });
-
-    if (toolCalls.length === 0) {
-      trimConversation(conv);
-      events.onDone({ toolsCalled, usage });
-      return;
-    }
-
-    for (const call of toolCalls) {
-      toolsCalled.push(call.function.name);
-      events.onToolCall(call.function.name, call.function.arguments);
-      // 安全门:有副作用的工具(如 run_shell)在执行前先过 Kev 判断。
-      // 普通工具 guardToolCall 直接放行,零开销。
-      const guard = await guardToolCall(call.function.name, call.function.arguments);
-      let result: string;
-      if (!guard.allowed) {
-        result = `⛔ 安全门拦截:${guard.reason}`;
-      } else {
-        result = await runTool(call);
+  try {
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const { content, toolCalls, usage: stepUsage } = await chatStream(messages, TOOLS, events.onToken);
+      // 累计 token(多轮 ReAct 循环里每一轮都消耗)
+      if (stepUsage) {
+        usage = usage
+          ? {
+              prompt_tokens: usage.prompt_tokens + stepUsage.prompt_tokens,
+              completion_tokens: usage.completion_tokens + stepUsage.completion_tokens,
+              total_tokens: usage.total_tokens + stepUsage.total_tokens,
+            }
+          : { ...stepUsage };
       }
-      if (guard.guarded) events.onGuard?.(guard);
-      events.onToolResult(result);
-      messages.push({ role: "tool", tool_call_id: call.id, content: result });
-    }
-  }
 
-  trimConversation(conv);
-  events.onDone({ toolsCalled, usage });
+      messages.push({
+        role: "assistant",
+        content: content || null,
+        tool_calls: toolCalls.length > 0 ? toolCalls : undefined,
+      });
+
+      if (toolCalls.length === 0) {
+        completed = true;
+        break;
+      }
+
+      for (const call of toolCalls) {
+        toolsCalled.push(call.function.name);
+        events.onToolCall(call.function.name, call.function.arguments);
+        // 安全门:有副作用的工具(如 run_shell)在执行前先过 Kev 判断。
+        // 普通工具 guardToolCall 直接放行,零开销。
+        const guard = await guardToolCall(call.function.name, call.function.arguments);
+        let result: string;
+        if (!guard.allowed) {
+          result = `⛔ 安全门拦截:${guard.reason}`;
+        } else {
+          result = await runTool(call);
+        }
+        if (guard.guarded) events.onGuard?.(guard);
+        events.onToolResult(result);
+        messages.push({ role: "tool", tool_call_id: call.id, content: result });
+      }
+    }
+
+    // 达到上限也要给用户一个明确结果，而不是静默结束。
+    if (!completed) {
+      messages.push({ role: "assistant", content: "已达到最大步数（8 步），任务未完成。" });
+    }
+
+    conv.messages = messages;
+    trimConversation(conv);
+    events.onDone({ toolsCalled, usage, maxStepsReached: !completed });
+  } catch (e) {
+    // 失败不污染已有会话：conv.messages 保持调用前的状态。
+    throw e;
+  }
 }

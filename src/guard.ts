@@ -26,6 +26,9 @@ const GUARDED_TOOLS = new Set(["run_shell"]);
 // 只匹配明确的破坏性命令,不碰 dir/echo/type 这类安全命令。
 const HARD_BLOCK: { pattern: RegExp; why: string }[] = [
   { pattern: /\brm\s+(-[a-z]*[rf][a-z]*)\b/i, why: "rm 递归/强制删除" },
+  { pattern: /\brm\b[^\n]*--(recursive|force)\b/i, why: "rm 长参数递归/强制删除" },
+  { pattern: /\b(remove-item|ri)\b[^\n]*-recurse\b/i, why: "PowerShell 递归删除" },
+  { pattern: /\b(remove-item|ri)\b[^\n]*-force\b/i, why: "PowerShell 强制删除" },
   { pattern: /\brmdir\s+\/(s|q)\b/i, why: "rmdir 递归删除" },
   { pattern: /\bdel\s+\/[sfq]/i, why: "del 递归/强制删除" },
   { pattern: /\bformat\s+[a-z]:/i, why: "格式化磁盘" },

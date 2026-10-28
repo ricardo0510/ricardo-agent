@@ -46,10 +46,23 @@ function apiConfig() {
 //   2. 瞬时故障 —— 网络抖动 / 429 限流 / 5xx 服务错误,指数退避重试;
 //      4xx 客户端错误(参数错、鉴权错)不重试,因为重试也不会变对
 const FETCH_TIMEOUT_MS = 60_000;
+const STREAM_TIMEOUT_MS = 180_000; // 整个流式响应（含 body 读取）的上限
 const MAX_RETRIES = 2; // 共 3 次尝试
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// 合并调用方信号与本次尝试的超时信号；任一触发都中止请求。
+function combineSignals(a?: AbortSignal | null, b?: AbortSignal): AbortSignal | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.aborted || b.aborted) return AbortSignal.abort();
+  const merged = new AbortController();
+  const onAbort = () => merged.abort();
+  a.addEventListener("abort", onAbort, { once: true });
+  b.addEventListener("abort", onAbort, { once: true });
+  return merged.signal;
 }
 
 async function fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
@@ -58,12 +71,14 @@ async function fetchWithRetry(url: string, init: RequestInit): Promise<Response>
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
     try {
-      const res = await fetch(url, { ...init, signal: controller.signal });
+      const res = await fetch(url, { ...init, signal: combineSignals(init.signal, controller.signal) });
       const retryable = res.status === 429 || res.status >= 500;
       if (!retryable || attempt === MAX_RETRIES) return res;
       lastError = new Error(`HTTP ${res.status}(可重试)`);
     } catch (e) {
       lastError = e;
+      // 调用方主动取消（或整条流超时）时不再重试
+      if (init.signal?.aborted || controller.signal.aborted) throw e;
       if (attempt === MAX_RETRIES) throw e;
     } finally {
       clearTimeout(timer);
@@ -116,82 +131,92 @@ export async function chatStream(
   onContent: (chunk: string) => void
 ): Promise<StreamResult> {
   const { baseUrl, model } = apiConfig();
-  const res = await fetchWithRetry(`${baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      tools: tools && tools.length > 0 ? tools : undefined,
-      temperature: 0.2,
-      stream: true, // 关键:开流式
-      stream_options: { include_usage: true }, // 让最后一块带上 token 用量
-    }),
-  });
+  // 超时必须覆盖「建立连接 + 读完整个流」，否则 body 卡住会永久挂起。
+  const streamController = new AbortController();
+  const streamTimer = setTimeout(() => streamController.abort(), STREAM_TIMEOUT_MS);
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`API 错误 ${res.status}: ${text.slice(0, 500)}`);
-  }
+  try {
+    const res = await fetchWithRetry(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      signal: streamController.signal,
+      body: JSON.stringify({
+        model,
+        messages,
+        tools: tools && tools.length > 0 ? tools : undefined,
+        temperature: 0.2,
+        stream: true, // 关键:开流式
+        stream_options: { include_usage: true }, // 让最后一块带上 token 用量
+      }),
+    });
 
-  // SSE 格式:每行一个 `data: {...}`,空行分隔,结束标记是 `data: [DONE]`
-  const reader = res.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let content = "";
-  let usage: Usage | undefined;
-  const toolCalls: ToolCall[] = []; // 按 index 累积(模型可能同时调多个工具)
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`API 错误 ${res.status}: ${text.slice(0, 500)}`);
+    }
+    if (!res.body) throw new Error("API 响应没有 body");
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    // SSE 格式:每行一个 `data: {...}`,空行分隔,结束标记是 `data: [DONE]`
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let content = "";
+    let usage: Usage | undefined;
+    const toolCalls: ToolCall[] = []; // 按 index 累积(模型可能同时调多个工具)
 
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? ""; // 最后一行可能被截断,留下次拼
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const payload = t.slice(5).trim();
-      if (payload === "[DONE]") continue;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-      let json: any;
-      try {
-        json = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-      // 最后一个 chunk:choices 为空,只带 usage(因为开了 include_usage)
-      if (json.usage) {
-        usage = json.usage;
-        continue;
-      }
-      const delta = json.choices?.[0]?.delta;
-      if (!delta) continue;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? ""; // 最后一行可能被截断,留下次拼
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith("data:")) continue;
+        const payload = t.slice(5).trim();
+        if (payload === "[DONE]") continue;
 
-      if (delta.content) {
-        content += delta.content;
-        onContent(delta.content); // 逐字回调,驱动打字机效果
-      }
+        let json: any;
+        try {
+          json = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        // 最后一个 chunk:choices 为空,只带 usage(因为开了 include_usage)
+        if (json.usage) {
+          usage = json.usage;
+          continue;
+        }
+        const delta = json.choices?.[0]?.delta;
+        if (!delta) continue;
 
-      // 工具调用是「分片」来的:name/arguments 拆成一段段,按 index 拼起来
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0;
-          if (!toolCalls[idx]) {
-            toolCalls[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
+        if (delta.content) {
+          content += delta.content;
+          onContent(delta.content); // 逐字回调,驱动打字机效果
+        }
+
+        // 工具调用是「分片」来的:name/arguments 拆成一段段,按 index 拼起来
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCalls[idx]) {
+              toolCalls[idx] = { id: "", type: "function", function: { name: "", arguments: "" } };
+            }
+            if (tc.id) toolCalls[idx].id = tc.id;
+            if (tc.type) toolCalls[idx].type = tc.type;
+            if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
+            if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
           }
-          if (tc.id) toolCalls[idx].id = tc.id;
-          if (tc.type) toolCalls[idx].type = tc.type;
-          if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
-          if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
         }
       }
     }
-  }
 
-  return { content, toolCalls: toolCalls.filter(Boolean), usage };
+    return { content, toolCalls: toolCalls.filter(Boolean), usage };
+  } finally {
+    clearTimeout(streamTimer);
+  }
 }

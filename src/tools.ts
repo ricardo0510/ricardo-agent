@@ -8,7 +8,7 @@
 // framework/ 里的 AI SDK 版直接 import 这些函数复用,只换「定义方式」。
 
 import { exec } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -16,21 +16,45 @@ import type { ToolCall, ToolDef } from "./llm.js";
 
 const execAsync = promisify(exec);
 
+const NETWORK_TIMEOUT_MS = 10_000;
+const MAX_FILE_BYTES = 200_000;
+const USER_AGENT = "agent-cli/0.1 (+https://github.com/ricardo0510/ricardo-agent)";
+
+/** 带超时、状态码和 content-type 校验的 JSON 请求。 */
+async function fetchJson(url: string): Promise<any> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NETWORK_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!contentType.includes("json")) {
+      throw new Error(`返回的不是 JSON（${contentType || "未知类型"}）`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------- 工具实现(真实逻辑) ----------
 
 export async function getWeather(city: string): Promise<string> {
   // 用 Open-Meteo(免费、无需 key)。第一步:地理编码,城市名 → 经纬度。
-  const geo = (await fetch(
+  const geo = (await fetchJson(
     `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`
-  ).then((r) => r.json())) as { results?: { latitude: number; longitude: number; name: string; country: string }[] };
+  )) as { results?: { latitude: number; longitude: number; name: string; country: string }[] };
 
   const hit = geo.results?.[0];
   if (!hit) return `没找到「${city}」,换个城市名试试。`;
 
   const { latitude, longitude, name, country } = hit;
-  const w = (await fetch(
+  const w = (await fetchJson(
     `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code,wind_speed_10m&timezone=auto`
-  ).then((r) => r.json())) as { current: { temperature_2m: number; weather_code: number; wind_speed_10m: number } };
+  )) as { current: { temperature_2m: number; weather_code: number; wind_speed_10m: number } };
 
   const c = w.current;
   return `${name}(${country}) 当前 ${c.temperature_2m}°C,${describeWeatherCode(c.weather_code)},风速 ${c.wind_speed_10m} km/h`;
@@ -108,12 +132,17 @@ export function getCurrentTime(timezone?: string): string {
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 export async function readTextFile(relativePath: string): Promise<string> {
-  // 安全:只允许读项目目录内的文件,拒绝越界路径
+  // 安全:只允许读项目目录内的文件,拒绝越界路径(含 ../ 与同前缀兄弟目录)
   const abs = path.resolve(PROJECT_ROOT, relativePath);
-  if (!abs.startsWith(PROJECT_ROOT)) {
+  const rel = path.relative(PROJECT_ROOT, abs);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
     return "拒绝:只能读当前项目目录内的文件。";
   }
   try {
+    const info = await stat(abs);
+    if (info.size > MAX_FILE_BYTES) {
+      return `文件过大（${Math.round(info.size / 1024)}KB），已拒绝读取；上限 ${MAX_FILE_BYTES / 1000}KB。`;
+    }
     return await readFile(abs, "utf-8");
   } catch (e) {
     return `读文件失败:${(e as Error).message}`;
@@ -138,7 +167,7 @@ export async function searchWeb(query: string, limit = 3): Promise<string> {
   const url =
     `https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}` +
     `&format=json&srlimit=${limit}&srprop=snippet`;
-  const data = (await fetch(url).then((r) => r.json())) as {
+  const data = (await fetchJson(url)) as {
     query?: { search?: { title: string; snippet: string }[] };
   };
   const results = data.query?.search ?? [];
@@ -264,19 +293,19 @@ export async function runTool(call: ToolCall): Promise<string> {
     const args = JSON.parse(call.function.arguments || "{}");
     switch (call.function.name) {
       case "get_weather":
-        return getWeather(String(args.city));
+        return await getWeather(String(args.city));
       case "calculate":
         return String(calculate(String(args.expression)));
       case "get_current_time":
         return getCurrentTime(args.timezone ? String(args.timezone) : undefined);
       case "read_file":
-        return readTextFile(String(args.path));
+        return await readTextFile(String(args.path));
       case "search_web":
-        return searchWeb(String(args.query), args.limit ? Number(args.limit) : 3);
+        return await searchWeb(String(args.query), args.limit ? Number(args.limit) : 3);
       case "run_shell":
         // ⚠️ 这里只负责「执行」;「该不该执行」由 agent.ts 里的安全门先判。
         // 所以 runShell 被调用时,命令已经过了 Kev 检查。
-        return runShell(String(args.command));
+        return await runShell(String(args.command));
       default:
         return `未知工具:${call.function.name}`;
     }

@@ -9,11 +9,15 @@ import { checkHardBlock } from "../src/guard.js";
 describe("guard 硬规则黑名单", () => {
   it("破坏性命令命中拦截", () => {
     assert.ok(checkHardBlock("rm -rf / --no-preserve-root"));
+    assert.ok(checkHardBlock("rm -r -f /"));
+    assert.ok(checkHardBlock("rm --recursive --force /"));
     assert.ok(checkHardBlock("del /s /q C:\\Windows\\System32\\*"));
     assert.ok(checkHardBlock("format C:"));
     assert.ok(checkHardBlock("shutdown /s /t 0"));
     assert.ok(checkHardBlock("rmdir /s /q C:\\important"));
     assert.ok(checkHardBlock("mkfs.ext4 /dev/sda1"));
+    assert.ok(checkHardBlock("Remove-Item -Recurse -Force C:\\important"));
+    assert.ok(checkHardBlock("ri -Recurse -Force C:\\important"));
   });
 
   it("安全命令不命中(放行)", () => {
